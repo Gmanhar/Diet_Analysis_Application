@@ -7,4 +7,5 @@ authlib
 python-dotenv
 requests
 gunicorn
+pyodbc
 
