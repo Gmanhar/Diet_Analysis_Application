@@ -80,3 +80,8 @@ Dockerfile
 *.zip
 *.tar
 *.gz
+# -------------------------
+# Database files (DO NOT COMMIT)
+# -------------------------
+users.db
+instance/users.db
