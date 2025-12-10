@@ -154,10 +154,10 @@
       </section>
     {% endif %}
 
-    <!-- Recipes (simple text list from `message`) -->
+    <!-- Recipes and Clusters (text list from `message`) -->
     {% if message %}
       <section class="results">
-        <h2>Recipes</h2>
+        <h2>{% if request.form.get('action') == 'clusters' %}Cluster Analysis{% else %}Recipes{% endif %}</h2>
         <ul class="recipe-list">
           {% for m in message %}
             <li>{{ m }}</li>
