@@ -1,6 +1,7 @@
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 load_dotenv()
+
 from flask import (
     Flask,
     render_template,
@@ -8,21 +9,30 @@ from flask import (
     redirect,
     url_for,
     session,
-    flash
+    flash,
+    abort,
 )
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # for servers / no display
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-import io, base64, math, os
+import json
+import io
+import base64
+import math
+import os
 from datetime import datetime
 
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
 from urllib.parse import urlparse, urljoin
-from flask import abort
+from functools import wraps
 
+
+# ------------------------------
+# Paths & in-memory cache
+# ------------------------------
 DATA_PATH = "All_Diets.csv"
 CLEAN_PATH = "Cleaned_All_Diets.csv"
 
@@ -35,73 +45,22 @@ CACHE = {
 }
 
 
-def build_cache() -> None:
-    """
-    Read All_Diets.csv, clean it once, compute summary results and
-    store everything in the global CACHE dict. Also writes a cleaned
-    copy to Cleaned_All_Diets.csv for inspection / Azure upload.
-    """
-    df = pd.read_csv(DATA_PATH)
-
-    # clean numeric macro columns
-    for col in ["Protein(g)", "Carbs(g)", "Fat(g)"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df[["Protein(g)", "Carbs(g)", "Fat(g)"]] = df[["Protein(g)", "Carbs(g)", "Fat(g)"]].fillna(0)
-
-    # save cleaned copy (this simulates what your blob-trigger function would write)
-    try:
-        df.to_csv(CLEAN_PATH, index=False)
-    except Exception:
-        # not fatal if write fails locally
-        pass
-
-    # ----- precomputed results (used for charts) -----
-    avg_macros = df.groupby("Diet_type")[["Protein(g)", "Carbs(g)", "Fat(g)"]].mean()
-    recipe_counts = df["Diet_type"].value_counts()
-
-    CACHE["df"] = df
-    CACHE["avg_macros_by_diet"] = avg_macros
-    CACHE["recipe_counts_by_diet"] = recipe_counts
-
-
-def ensure_cache() -> None:
-    """
-    Ensure CACHE is up to date.
-    If All_Diets.csv changed on disk, re-run cleaning + summary calc once.
-    Otherwise reuse existing cleaned data & results.
-    """
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError("All_Diets.csv not found in project root")
-
-    src_mtime = os.path.getmtime(DATA_PATH)
-    if CACHE["df"] is None or CACHE["source_mtime"] != src_mtime:
-        # file changed or first load → rebuild cache once
-        build_cache()
-        CACHE["source_mtime"] = src_mtime
-
-
 # ------------------------------
 # Flask & DB setup
 # ------------------------------
 app = Flask(__name__)
-
-# SECRET_KEY is required for sessions (login state)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY")
 
-# Simple local DB; in Azure you’ll point this to Azure SQL / Cosmos
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-    "DATABASE_URL",  # set this in Azure
-    "sqlite:///users.db"  # fallback for local dev
+    "DATABASE_URL",          # Azure / production
+    "sqlite:///users.db",    # local fallback
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
-
 oauth = OAuth(app)
 
 # OAuth setup
-
 app.config["GITHUB_CLIENT_ID"] = os.getenv("GITHUB_CLIENT_ID")
 app.config["GITHUB_CLIENT_SECRET"] = os.getenv("GITHUB_CLIENT_SECRET")
 
@@ -117,7 +76,7 @@ oauth.register(
 
 
 # ------------------------------
-# User model
+# Models
 # ------------------------------
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -134,17 +93,102 @@ class User(db.Model):
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
+
+class ChartCache(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    data_json = db.Column(db.Text, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+
 # ------------------------------
 # One-time DB create (run once)
 # ------------------------------
 with app.app_context():
     db.create_all()
 
+
+# ------------------------------
+# Cache / summary helpers
+# ------------------------------
+def build_cache() -> None:
+    """
+    Read All_Diets.csv, clean it once, compute summary results and
+    store everything in the global CACHE dict. Also writes a cleaned
+    copy to Cleaned_All_Diets.csv for inspection / Azure upload.
+    """
+    df = pd.read_csv(DATA_PATH)
+
+    # clean numeric macro columns
+    for col in ["Protein(g)", "Carbs(g)", "Fat(g)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[["Protein(g)", "Carbs(g)", "Fat(g)"]] = df[
+        ["Protein(g)", "Carbs(g)", "Fat(g)"]
+    ].fillna(0)
+
+    # save cleaned copy (this simulates what your blob-trigger function would write)
+    try:
+        df.to_csv(CLEAN_PATH, index=False)
+    except Exception:
+        # not fatal if write fails locally
+        pass
+
+    # ----- precomputed results (used for charts) -----
+    avg_macros = df.groupby("Diet_type")[["Protein(g)", "Carbs(g)", "Fat(g)"]].mean()
+    recipe_counts = df["Diet_type"].value_counts()
+
+    CACHE["df"] = df
+    CACHE["avg_macros_by_diet"] = avg_macros
+    CACHE["recipe_counts_by_diet"] = recipe_counts
+
+    # ---- persist summary data into DB ----
+    avg_dict = avg_macros.round(2).to_dict(orient="index")
+    counts_dict = recipe_counts.to_dict()
+
+    def upsert_chart(key, data):
+        data_json = json.dumps(data)
+        entry = ChartCache.query.filter_by(key=key).first()
+        if not entry:
+            entry = ChartCache(key=key, data_json=data_json)
+            db.session.add(entry)
+        else:
+            entry.data_json = data_json
+        db.session.commit()
+
+    upsert_chart("avg_macros_by_diet", avg_dict)
+    upsert_chart("recipe_counts_by_diet", counts_dict)
+
+
+def ensure_cache() -> None:
+    """
+    Ensure CACHE is up to date.
+    If All_Diets.csv changed on disk, re-run cleaning + summary calc once.
+    Otherwise reuse existing cleaned data & results.
+    """
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError("All_Diets.csv not found in project root")
+
+    src_mtime = os.path.getmtime(DATA_PATH)
+    if CACHE["df"] is None or CACHE["source_mtime"] != src_mtime:
+        build_cache()
+        CACHE["source_mtime"] = src_mtime
+
+
+def get_chart_cache(key):
+    entry = ChartCache.query.filter_by(key=key).first()
+    if not entry:
+        return None
+    return json.loads(entry.data_json)
+
+
 # ------------------------------
 # Helper: login_required decorator
 # ------------------------------
-from functools import wraps
-
 def login_required(view_func):
     @wraps(view_func)
     def wrapped_view(*args, **kwargs):
@@ -157,18 +201,20 @@ def login_required(view_func):
 def fig_to_base64():
     """Return current Matplotlib figure as base64 string."""
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.savefig(buf, format="png", bbox_inches="tight")
     buf.seek(0)
-    data = base64.b64encode(buf.read()).decode('utf-8')
+    data = base64.b64encode(buf.read()).decode("utf-8")
     buf.close()
     plt.close()
     return data
+
 
 def filter_by_diet(df, diet_name: str):
     """Filter dataframe by diet type (case-insensitive). Empty diet_name returns original df."""
     if not diet_name:
         return df
     return df[df["Diet_type"].str.lower() == diet_name.lower()]
+
 
 def is_safe_url(target):
     ref_url = urlparse(request.host_url)
@@ -177,6 +223,7 @@ def is_safe_url(target):
         test_url.scheme in ("http", "https")
         and ref_url.netloc == test_url.netloc
     )
+
 
 # ------------------------------
 # Auth routes
@@ -215,6 +262,7 @@ def register():
 
     return render_template("register.html")
 
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if "user_id" in session:
@@ -237,10 +285,12 @@ def login():
 
     return render_template("login.html")
 
+
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
 
 # ------------------------------
 # Dashboard route (PROTECTED)
@@ -266,7 +316,11 @@ def index():
         df_filtered = filter_by_diet(df_all, selected_diet)
 
         # ----- 1) Bar chart: use precomputed averages -----
-        avg_macros = CACHE["avg_macros_by_diet"]
+        avg_data = get_chart_cache("avg_macros_by_diet")
+        if avg_data:
+            avg_macros = pd.DataFrame.from_dict(avg_data, orient="index")
+        else:
+            avg_macros = CACHE["avg_macros_by_diet"]  # fallback
 
         if selected_diet:
             # just the selected diet’s row (still from precomputed table)
@@ -308,7 +362,11 @@ def index():
         if selected_diet:
             cnt = df_filtered["Diet_type"].value_counts()
         else:
-            cnt = CACHE["recipe_counts_by_diet"]
+            counts_data = get_chart_cache("recipe_counts_by_diet")
+            if counts_data:
+                cnt = pd.Series(counts_data)
+            else:
+                cnt = CACHE["recipe_counts_by_diet"]
 
         plt.figure(figsize=(4, 4))
         plt.pie(cnt.values, labels=cnt.index, autopct="%1.1f%%", startangle=140)
@@ -383,9 +441,13 @@ def index():
         current_page=page,
         total_pages=total_pages,
         keyword=keyword,
-        user_name=user_name
+        user_name=user_name,
     )
 
+
+# ------------------------------
+# GitHub OAuth routes
+# ------------------------------
 @app.route("/login/github")
 def login_github():
     # Where to go after login (default is dashboard)
